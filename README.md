@@ -20,3 +20,8 @@ preferences (e.g., cuisine, budget, location), and evaluate its usability throug
 ## Tools
 - Python
 - Data analysis: R
+
+## NOTE: 
+This repository contains a cleaned and partial version of the original group project,
+shared for portfolio and educational purposes. Full data can't be shared because of privacy of the users.
+
