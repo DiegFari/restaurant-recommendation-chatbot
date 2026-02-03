@@ -1,0 +1,610 @@
+---
+title: "Data Analysis Methods"
+author: "Diego Farinella"
+date: "2025-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Installing Necessary Packages
+
+```{r}
+
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+
+install.packages("pak")
+pak::pak(c("DHARMa","sjPlot","emmeans","ordinal","psych","broom.mixed"))
+
+library(tidyverse)
+library(lme4); library(lmerTest)
+library(emmeans)
+library(ordinal)
+library(psych)
+library(DHARMa)
+library(broom.mixed)
+library(sjPlot)  
+library(lubridate)
+
+
+```
+
+## Data Pre-Processing
+
+### Loading the data and get chatbot order and task order
+
+```{r cars}
+summary(cars)
+
+# Loading the files
+int1 <- read_csv("interactions1.csv", show_col_types = FALSE)
+int2 <- read_csv("interactions2.csv", show_col_types = FALSE)
+ud1  <- read_csv("user_data1.csv", show_col_types = FALSE)
+ud2  <- read_csv("user_data2.csv", show_col_types = FALSE)
+
+# Inserting a column chatbot order in all files
+int1 <- int1  %>% mutate(chatbot_order = "fancy-ugly")
+int2 <- int2  %>% mutate(chatbot_order = "ugly-fancy")
+ud1  <- ud1   %>% mutate(chatbot_order = "fancy-ugly")
+ud2  <- ud2   %>% mutate(chatbot_order = "ugly-fancy")
+
+# Merge them
+interactions <- bind_rows(int1, int2)
+user_data    <- bind_rows(ud1, ud2)
+
+# Inserting a column task order in all files
+task_orders <- user_data %>%
+  arrange(user_id, timestamp_iso) %>%    
+  group_by(user_id) %>%
+  summarise(
+    first_task  = first(task_id),
+    second_task = nth(task_id, 2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    task_order = case_when(
+      first_task == "A" & second_task == "B" ~ "AB",
+      first_task == "B" & second_task == "A" ~ "BA",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(user_id, task_order)
+
+user_data    <- user_data    %>% left_join(task_orders, by = "user_id")
+interactions <- interactions %>% left_join(task_orders, by = "user_id")
+
+user_data <- user_data %>%
+  mutate(
+    # trim + collapse spaces
+    occupation  = str_squish(str_trim(occupation)),
+    nationality = str_squish(str_trim(nationality)),
+    sex         = str_squish(str_trim(sex)),
+
+    # lowercase -> recode -> title-case where useful
+    occupation  = str_to_lower(occupation),
+    nationality = str_to_lower(nationality),
+    sex         = str_to_title(sex),
+
+    # Harmonize common variants (add your own if needed)
+    occupation  = case_when(
+      occupation %in% c("student","studente") ~ "Student",
+      occupation %in% c("teacher","professor") ~ "Teacher",
+      occupation %in% c("trial","test","debug") ~ "Trial",   # will drop later
+      TRUE ~ str_to_title(occupation)
+    ),
+    nationality = case_when(
+      nationality %in% c("dutch","nl") ~ "Dutch",
+      nationality %in% c("italian","it") ~ "Italian",
+      nationality %in% c("blah blah","trial","test","debug","na","n/a","") ~ NA_character_,
+      TRUE ~ str_to_title(nationality)
+    )
+  )
+
+trial_users <- user_data %>%
+  filter(occupation == "Trial" |
+         str_detect(coalesce(comments, ""), regex("trial|test|debug", ignore_case = TRUE))) %>%
+  pull(user_id)
+
+user_data <- user_data %>%
+  filter(!user_id %in% trial_users)
+
+interactions <- interactions %>%
+  filter(!user_id %in% trial_users)
+
+user_data
+interactions
+
+
+```
+
+### Calculating Reaction Time Metrics
+
+```{r pressure, echo=FALSE}
+
+# Make sure timestamp is datetime
+interactions <- interactions %>%
+  mutate(timestamp_iso = ymd_hms(timestamp_iso))
+
+# Calculating per-message RT (seconds and milliseconds)
+interactions <- interactions %>%
+  arrange(user_id, session_id, timestamp_iso) %>%
+  group_by(user_id, session_id) %>%
+  mutate(
+    prev_time = lag(timestamp_iso),
+    prev_role = lag(role),
+    reaction_time = if_else(
+      role == "user" & prev_role %in% c("assistant","system"),
+      as.numeric(difftime(timestamp_iso, prev_time, units = "secs")),
+      NA_real_
+    ),
+    reaction_time_ms = reaction_time * 1000
+  ) %>%
+  ungroup() %>%
+  select(-prev_time, -prev_role)
+
+interactions
+
+# Calculate per-user avg RT per chatbot
+
+# cleaning the data making the conditions appear the same
+interactions <- interactions %>%
+  mutate(cond_simple = case_when(
+    condition %in% c("chatbot_ugly","Ugly_UI","ugly")     ~ "ugly",
+    condition %in% c("chatbot_fancy","Pretty_UI","fancy") ~ "fancy",
+    TRUE ~ NA_character_
+  ))
+
+# per-user × condition mean RT
+interactions_rt <- interactions %>%
+  filter(role == "user", !is.na(reaction_time), !is.na(cond_simple)) %>%
+  group_by(user_id, cond_simple) %>%
+  summarize(avg_rt_s = mean(reaction_time), n_msgs = n(), .groups="drop")
+
+# wide version (one row per user; columns: avg_rt_fancy / avg_rt_ugly)
+interactions_rt_wide <- interactions_rt %>%
+  select(user_id, cond_simple, avg_rt_s) %>%
+  pivot_wider(names_from = cond_simple, values_from = avg_rt_s,
+              names_prefix = "avg_rt_")  # -> avg_rt_fancy, avg_rt_ugly
+
+# Adding it also to user data
+# add a per-row RT that matches that row's UI (ugly/fancy)
+user_data <- user_data %>%
+  mutate(cond_simple = case_when(
+    ui_type %in% c("Ugly_UI","chatbot_ugly","ugly")     ~ "ugly",
+    ui_type %in% c("Pretty_UI","chatbot_fancy","fancy") ~ "fancy",
+    TRUE ~ NA_character_
+  )) %>%
+  left_join(interactions_rt, by = c("user_id","cond_simple"))
+
+interactions_rt_wide
+user_data
+
+
+
+```
+
+### Calculate the score of the CUQ
+
+```{r}
+
+# CUQ items (8 positive / 8 negative = 16 total)
+cuq_pos <- c(
+  "personality_realistic_engaging",   # Q1
+  "welcoming_initial_setup",          # Q3
+  "explained_scope_purpose_well",     # Q5
+  "easy_to_navigate",                 # Q7
+  "understood_me_well",               # Q9
+  "responses_useful_informative",     # Q11
+  "coped_well_with_errors",           # Q13
+  "very_easy_to_use"                  # Q15
+)
+
+cuq_neg <- c(
+  "seemed_too_robotic",               # Q2
+  "seemed_very_unfriendly",           # Q4
+  "no_indication_of_purpose",         # Q6
+  "easy_to_get_confused",             # Q8
+  "failed_to_recognise_inputs",       # Q10
+  "responses_irrelevant",             # Q12
+  "unable_to_handle_errors",          # Q14
+  "very_complex"                      # Q16
+)
+
+cuq_items <- c(cuq_pos, cuq_neg)
+
+# ---- Keep only consented rows with sufficient CUQ answers (trials already removed earlier) ----
+user_data_clean <- user_data %>%
+  mutate(
+    cuq_items_answered = rowSums(!is.na(across(all_of(cuq_items))))
+  ) %>%
+  filter(
+    is.na(informed_consent) | informed_consent,
+    cuq_items_answered >= 12
+  )
+
+# ---- Compute CUQ score per instructions (no re-cleaning or trial filtering here) ----
+user_data_clean <- user_data_clean %>%
+  rowwise() %>%
+  mutate(
+    sum_pos = sum(c_across(all_of(cuq_pos)), na.rm = TRUE),
+    sum_neg = sum(c_across(all_of(cuq_neg)), na.rm = TRUE),
+    cuq_score = ((sum_pos - 8) + (40 - sum_neg)) / 64 * 100,
+    cuq_complete = cuq_items_answered == length(cuq_items)
+  ) %>%
+  ungroup() %>%
+  select(-sum_pos, -sum_neg)
+
+user_data_clean
+
+```
+
+## Check For Task Counterbalancing over Chatbot Order
+
+```{r}
+
+user_data_clean %>%
+  distinct(user_id, task_order) %>%
+  count(task_order)
+
+user_data_clean %>%
+  distinct(user_id, task_order, chatbot_order) %>%
+  count(chatbot_order, task_order) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+tbl <- user_data_clean %>%
+  distinct(user_id, task_order, chatbot_order) %>%
+  count(chatbot_order, task_order) %>%
+  pivot_wider(names_from = task_order, values_from = n, values_fill = 0) %>%
+  column_to_rownames("chatbot_order")
+
+chisq.test(tbl)
+fisher.test(tbl)
+
+user_data_clean %>%
+  distinct(user_id, task_order, chatbot_order) %>%
+  ggplot(aes(x = chatbot_order, fill = task_order)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Counterbalancing Check: Task Order × Chatbot Order",
+    x = "Chatbot Order", y = "Percentage of Participants",
+    fill = "Task Order"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+## Running some statistics of the data
+
+```{r}
+
+user_unique <- user_data_clean %>%
+  group_by(user_id) %>%
+  summarise(
+    age         = first(age),
+    sex         = first(sex),
+    occupation  = first(occupation),
+    nationality = first(nationality),
+    .groups = "drop"              # NEW: avoid grouped df downstream
+  )
+
+# Summary statistics for age
+user_unique %>%
+  summarise(
+    n       = n(),
+    mean_age= mean(age, na.rm = TRUE),
+    sd_age  = sd(age, na.rm = TRUE),
+    min_age = min(age, na.rm = TRUE),
+    max_age = max(age, na.rm = TRUE)
+  )
+
+# Frequency tables (drop NA rows so percents make sense)
+user_unique %>%
+  filter(!is.na(nationality)) %>%
+  count(nationality, sort = TRUE) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+user_unique %>%
+  filter(!is.na(occupation)) %>%
+  count(occupation, sort = TRUE) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+user_unique %>%
+  filter(!is.na(sex)) %>%
+  count(sex, sort = TRUE) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+# Plotting
+
+# Nationality
+ggplot(user_unique, aes(x = fct_infreq(nationality), fill = nationality)) +
+  geom_bar(show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Distribution of Nationalities", x = "Nationality", y = "Count") +
+  theme_minimal(base_size = 14)
+
+# Sex
+ggplot(user_unique, aes(x = sex, fill = sex)) +
+  geom_bar(show.legend = FALSE, alpha = 0.8) +
+  labs(title = "Sex Distribution", x = "Sex", y = "Count") +
+  theme_minimal(base_size = 14)
+
+# Occupation
+ggplot(user_unique, aes(x = fct_infreq(occupation), fill = occupation)) +
+  geom_bar(show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Distribution of Occupations", x = "Occupation", y = "Count") +
+  theme_minimal(base_size = 14)
+
+
+
+
+```
+
+## Manipulation check
+
+```{r}
+
+# Keep only rows with valid manipulation check + condition
+user_mc <- user_data %>%
+  semi_join(user_data_clean %>% distinct(user_id), by = "user_id") %>%
+  mutate(
+    cond_simple = case_when(
+      ui_type %in% c("Pretty_UI","chatbot_fancy","fancy") ~ "fancy",
+      ui_type %in% c("Ugly_UI","chatbot_ugly","ugly")     ~ "ugly",
+      TRUE ~ NA_character_
+    ),
+    # nice consistent ordering in plots/tables
+    cond_simple = factor(cond_simple, levels = c("fancy","ugly"))
+  ) %>%
+  filter(cond_simple %in% c("fancy","ugly"))
+
+# Plot of manipulation check scores
+user_mc %>%
+  filter(!is.na(man_check)) %>%
+  ggplot(aes(x = cond_simple, y = man_check, fill = cond_simple)) +
+  geom_boxplot(alpha = 0.7, width = 0.6, outlier.shape = 21, color = "gray40") +
+  geom_jitter(width = 0.1, alpha = 0.5, size = 2) +
+  labs(
+    title = "Manipulation Check: Appearance Rating by Condition",
+    x = "Chatbot Condition",
+    y = "Manipulation Check Score (1–5)"
+  ) +
+  scale_fill_manual(values = c("fancy" = "#7fc97f", "ugly" = "#fdc086")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+# Build a clean manipulation-check table (one row per user × condition)
+man_clean <- user_mc %>%
+  filter(!is.na(man_check)) %>%
+  group_by(user_id, cond_simple) %>%
+  summarise(man_check = mean(man_check, na.rm = TRUE), .groups = "drop")
+
+# Keep only users who have BOTH scores
+man_wide <- man_clean %>%
+  pivot_wider(names_from = cond_simple, values_from = man_check) %>%
+  drop_na(fancy, ugly)
+
+# 3) Paired t-test
+t_man <- t.test(man_wide$fancy, man_wide$ugly, paired = TRUE)
+t_man
+
+```
+
+## Checking distribution of RTs and transform the data
+
+```{r}
+
+
+avg_rt_data <- interactions_rt %>%
+  # ensure we only use users that survived your CUQ/trial filters
+  semi_join(user_data_clean %>% distinct(user_id), by = "user_id") %>%
+  # pull orders from the cleaned table (not raw user_data)
+  left_join(user_data_clean %>% distinct(user_id, task_order, chatbot_order),
+            by = "user_id") %>%
+  # guard against non-finite/zero RTs before logging
+  filter(is.finite(avg_rt_s), avg_rt_s > 0) %>%
+  mutate(log_avg_rt = log(avg_rt_s))
+
+
+# Raw average RTs
+p1 <- ggplot(avg_rt_data, aes(x = avg_rt_s)) +
+  geom_histogram(binwidth = 0.5, fill = "#3182bd", color = "white", alpha = 0.8) +
+  labs(title = "Distribution of Average RT (Raw)",
+       x = "Average RT (seconds)", y = "Count") +
+  theme_minimal()
+
+# Log-transformed average RTs
+p2 <- ggplot(avg_rt_data, aes(x = log_avg_rt)) +
+  geom_histogram(binwidth = 0.1, fill = "#31a354", color = "white", alpha = 0.8) +
+  labs(title = "Distribution of Average RT (Log-transformed)",
+       x = "log(Average RT)", y = "Count") +
+  theme_minimal()
+p1
+p2
+
+qq_raw <- ggplot(avg_rt_data, aes(sample = avg_rt_s)) +
+  stat_qq(color = "#3182bd") +
+  stat_qq_line(color = "gray40") +
+  labs(title = "Q–Q Plot (Raw Average RT)") +
+  theme_minimal()
+
+qq_log <- ggplot(avg_rt_data, aes(sample = log_avg_rt)) +
+  stat_qq(color = "#31a354") +
+  stat_qq_line(color = "gray40") +
+  labs(title = "Q–Q Plot (Log-transformed Average RT)") +
+  theme_minimal()
+
+qq_raw
+qq_log 
+
+shapiro.test(avg_rt_data$avg_rt_s)
+shapiro.test(avg_rt_data$log_avg_rt)
+
+```
+
+## Models to Investigate the effect of the UI on avg logged RT 
+
+```{r}
+
+
+# Plotting the rt
+ggplot(avg_rt_data, aes(x = cond_simple, y = log_avg_rt, fill = cond_simple)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2, color = "black") +
+  scale_fill_manual(values = c("fancy" = "#74c476", "ugly" = "#fd8d3c")) +
+  labs(
+    title = "Average Reaction Time by Chatbot Condition",
+    x = "Chatbot Condition",
+    y = "Logged Average Reaction Time"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+
+# Simple model
+m1 <- lmer(log_avg_rt ~ cond_simple + (1 | user_id), data = avg_rt_data)
+summary(m1)
+
+# Model with task order
+m2 <- lmer(log_avg_rt ~ cond_simple * task_order + (1 | user_id), data = avg_rt_data)
+summary(m2)
+
+# Model with chatbot order
+m3 <- lmer(log_avg_rt ~ cond_simple * chatbot_order + (1 | user_id), data = avg_rt_data)
+summary(m3)
+
+# Full model
+m_full <- lmer(log_avg_rt ~ cond_simple * task_order * chatbot_order + (1 | user_id), data = avg_rt_data)
+summary(m_full)
+
+
+
+```
+
+## Models to investigate the effect of UI on CUQ score
+
+```{r}
+
+# Cleaning cuq data
+cuq_data <- user_data_clean %>%
+  filter(!is.na(cuq_score), !is.na(cond_simple))
+
+summary(cuq_data$cuq_score)
+table(cuq_data$cond_simple)
+
+# Quick visualization
+ggplot(cuq_data, aes(x = cond_simple, y = cuq_score, fill = cond_simple)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(title = "CUQ Scores by Chatbot Condition",
+       x = "Chatbot condition", y = "CUQ usability score") +
+  theme_minimal()
+
+# SImple model
+m1_cuq <- lmer(cuq_score ~ cond_simple + (1 | user_id), data = cuq_data)
+summary(m1_cuq)
+
+# Add task order
+m2_cuq <- lmer(cuq_score ~ cond_simple * task_order + (1 | user_id), data = cuq_data)
+
+# Add chatbot order
+m3_cuq <- lmer(cuq_score ~ cond_simple * chatbot_order + (1 | user_id), data = cuq_data)
+
+# Full model
+m_full_cuq <- lmer(cuq_score ~ cond_simple * task_order * chatbot_order + (1 | user_id), data = cuq_data)
+
+summary(m2_cuq)
+summary(m3_cuq)
+summary(m_full_cuq)
+
+
+```
+
+## Models for the mental demand and frustration data
+
+```{r}
+
+# Mental demand data
+demand_data <- user_data_clean %>%
+  filter(!is.na(Nasa_tlx_1), !is.na(cond_simple)) %>%
+  mutate(cond_simple = factor(cond_simple, levels = c("fancy", "ugly")))
+
+# Visualization
+ggplot(demand_data, aes(x = cond_simple, y = Nasa_tlx_1, fill = cond_simple)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(title = "Mental Demand by Chatbot Condition (NASA-TLX)",
+       x = "Chatbot Condition", y = "Mental Demand Score") +
+  theme_minimal()
+
+# Models
+m1_demand <- lmer(Nasa_tlx_1 ~ cond_simple + (1 | user_id), data = demand_data)
+m2_demand <- lmer(Nasa_tlx_1 ~ cond_simple * task_order + (1 | user_id), data = demand_data)
+m3_demand <- lmer(Nasa_tlx_1 ~ cond_simple * chatbot_order + (1 | user_id), data = demand_data)
+m_full_demand <- lmer(Nasa_tlx_1 ~ cond_simple * task_order * chatbot_order + (1 | user_id), data = demand_data)
+
+summary(m1_demand)
+summary(m2_demand)
+summary(m3_demand)
+summary(m_full_demand)
+
+# Frusration data 
+stress_data <- user_data_clean %>%
+  filter(!is.na(Nasa_tlx_2), !is.na(cond_simple)) %>%
+  mutate(cond_simple = factor(cond_simple, levels = c("fancy", "ugly")))
+
+# Visualization
+ggplot(stress_data, aes(x = cond_simple, y = Nasa_tlx_2, fill = cond_simple)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(title = "Stress by Chatbot Condition (NASA-TLX)",
+       x = "Chatbot Condition", y = "Stress Score") +
+  theme_minimal()
+
+# Models
+m1_stress <- lmer(Nasa_tlx_2 ~ cond_simple + (1 | user_id), data = stress_data)
+m2_stress <- lmer(Nasa_tlx_2 ~ cond_simple * task_order + (1 | user_id), data = stress_data)
+m3_stress <- lmer(Nasa_tlx_2 ~ cond_simple * chatbot_order + (1 | user_id), data = stress_data)
+m_full_stress <- lmer(Nasa_tlx_2 ~ cond_simple * task_order * chatbot_order + (1 | user_id), data = stress_data)
+
+summary(m1_stress)
+summary(m2_stress)
+summary(m3_stress)
+summary(m_full_stress)
+
+```
+
+## Models for the goal check
+
+```{r}
+
+goal_data <- user_data_clean %>%
+  filter(!is.na(goal_check), !is.na(cond_simple)) %>%
+  mutate(cond_simple = factor(cond_simple, levels = c("fancy","ugly")))
+
+# Visualization
+ggplot(goal_data, aes(x = cond_simple, y = goal_check, fill = cond_simple)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.6) +
+  labs(
+    title = "Goal Check by Chatbot Condition",
+    x = "Chatbot Condition",
+    y = "Goal Check Score"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+# Models
+m1_goal <- lmer(goal_check ~ cond_simple + (1 | user_id), data = goal_data)
+m2_goal <- lmer(goal_check ~ cond_simple * task_order + (1 | user_id), data = goal_data)
+m3_goal <- lmer(goal_check ~ cond_simple * chatbot_order + (1 | user_id), data = goal_data)
+m_full_goal <- lmer(goal_check ~ cond_simple * task_order * chatbot_order + (1 | user_id), data = goal_data)
+
+summary(m1_goal)
+summary(m2_goal)
+summary(m3_goal)
+summary(m_full_goal)
+```
